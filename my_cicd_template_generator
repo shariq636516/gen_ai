@@ -1,0 +1,1602 @@
+import streamlit as st
+import yaml  # This is correct - we import as 'yaml' but install as 'PyYAML'
+import re
+import io
+import zipfile
+from typing import List, Dict, Any, Optional, Tuple
+import sqlparse
+import os
+import datetime
+from copy import deepcopy
+
+# Set page config
+st.set_page_config(page_title="SQL to Snowrunner CICD Template Converter", layout="wide")
+
+def generate_sql_variable_header(query_name: str) -> str:
+    """Generate a standard SQL header with variable declarations for Snowrunner."""
+    return f"""-- Standard variable declarations for Snowrunner deployment
+set v_crud_role                 = concat($DB_ENV ,'_CRUD_ROLE');
+set v_ro_role                   = concat($DB_ENV ,'RO_ROLE');
+set v_trst_database             = concat($DB_ENV,'MY_DB');
+set my_target_database          = $target_database;
+set v_fnd_database              = $fnd_db;
+set v_trst_schema               = 'MY_DB_STAGING';
+set v_dimensional_schema        = 'MY_DB_TARGET';
+set v_source_prd                = 'MY_DB_SOURCE';
+set v_trst_view_name            = '{query_name}';
+set v_warehouse                 = concat($DB_ENV,'_caio_iet_developer_s_wh');  
+
+-- Fully qualify paths using variables
+set v_trst_view                 = CONCAT($my_target_database,'.',$v_trst_schema,'.',$v_trst_view_name);
+set v_cmc_pdrt_rate_tbl_path    = CONCAT($v_fnd_database,'.',$v_abacus_prd_bronze,'.table_1');
+set v_cmc_pdbl_prod_bill_path   = CONCAT($v_fnd_database,'.',$v_abacus_prd_bronze,'.table_2');
+set v_billing_comp_type_dim_path = CONCAT($my_target_database,'.',$v_dimensional_schema,'.table_3');
+
+-- Set context
+use identifier($v_warehouse);
+use identifier($my_target_database);
+use identifier($v_trst_schema);
+
+"""
+
+def parse_columns_from_sql(sql_query: str) -> List[Dict[str, str]]:
+    """Extract column information from the SQL query using sqlparse."""
+    try:
+        # Find the CREATE statement in the SQL file
+        create_statements = []
+        statements = sqlparse.split(sql_query)
+        for stmt in statements:
+            parsed = sqlparse.parse(stmt)
+            if parsed and parsed[0].get_type() == 'CREATE':
+                create_statements.append(parsed[0])
+        
+        if not create_statements:
+            return []
+            
+        # Use the last CREATE statement (most likely the main view/table creation)
+        parsed = create_statements[-1]
+        columns = []
+        
+        # Handle CREATE TABLE/VIEW statements
+        if parsed.get_type() == 'CREATE':
+            # Find the part after SELECT in a CREATE ... AS SELECT statement
+            select_part = None
+            as_found = False
+            for token in parsed.tokens:
+                if as_found and token.ttype is None and hasattr(token, 'tokens'):
+                    for subtoken in token.tokens:
+                        if str(subtoken).upper().strip() == 'SELECT':
+                            select_part = token
+                            break
+                    if select_part:
+                        break
+                if str(token).upper().strip() == 'AS':
+                    as_found = True
+            
+            # If found, extract columns from the SELECT part
+            if select_part:
+                # Use a safer approach to extract columns from the SELECT statement
+                select_stmt = str(select_part)
+                # Find the part between SELECT and FROM
+                columns_part_match = re.search(r'SELECT\s+(.*?)\s+FROM', select_stmt, re.IGNORECASE | re.DOTALL)
+                
+                if columns_part_match:
+                    columns_part = columns_part_match.group(1)
+                    # Split by commas, handling nested expressions
+                    column_expressions = []
+                    current_expr = ""
+                    paren_level = 0
+                    
+                    for char in columns_part:
+                        if char == '(' or char == '{' or char == '[':
+                            paren_level += 1
+                            current_expr += char
+                        elif char == ')' or char == '}' or char == ']':
+                            paren_level -= 1
+                            current_expr += char
+                        elif char == ',' and paren_level == 0:
+                            column_expressions.append(current_expr.strip())
+                            current_expr = ""
+                        else:
+                            current_expr += char
+                    
+                    if current_expr:
+                        column_expressions.append(current_expr.strip())
+                    
+                    # Process each column expression
+                    for expr in column_expressions:
+                        # Check for AS alias
+                        as_match = re.search(r'(.*?)\s+AS\s+(\w+)', expr, re.IGNORECASE)
+                        if as_match:
+                            col_expr = as_match.group(1).strip()
+                            col_name = as_match.group(2).strip('`[]"')
+                            col_desc = f"Derived from: {col_expr}"
+                        else:
+                            # For simple column names without AS
+                            col_parts = expr.strip().split('.')
+                            col_name = col_parts[-1].strip('`[]"')
+                            col_desc = "From source table"
+                        
+                        columns.append({
+                            "name": col_name,
+                            "description": col_desc
+                        })
+        
+        # If we couldn't extract columns using sqlparse approach, try regex fallback
+        if not columns:
+            # Simple regex for column extraction - works for straightforward CREATE statements
+            col_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+\w+\s*\(\s*(.*?)\s*\)'
+            col_match = re.search(col_pattern, sql_query, re.IGNORECASE | re.DOTALL)
+            if col_match:
+                col_section = col_match.group(1)
+                for col_def in col_section.split(','):
+                    col_parts = col_def.strip().split()
+                    if col_parts:
+                        columns.append({
+                            "name": col_parts[0].strip('`[]"'),
+                            "description": f"Type: {' '.join(col_parts[1:])}" if len(col_parts) > 1 else ""
+                        })
+        
+        return columns
+    except Exception as e:
+        # Graceful fallback if parsing fails
+        st.warning(f"Could not extract columns: {str(e)}")
+        return []
+
+def determine_sql_type(sql_query: str) -> str:
+    """Determine SQL type: ddl, dml, or storedproc."""
+    # Check for stored procedures first
+    if re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE', sql_query, re.IGNORECASE):
+        return "storedproc"
+    
+    # Check for DDL (CREATE TABLE/VIEW)
+    if re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW)', sql_query, re.IGNORECASE):
+        return "ddl"
+    
+    # Check for DML operations
+    dml_pattern = r'(?:INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|MERGE\s+INTO|WITH|SELECT\s+)'
+    if re.search(dml_pattern, sql_query, re.IGNORECASE):
+        return "dml"
+    
+    # Default to DDL for ambiguous cases
+    return "ddl"
+
+def extract_table_names_from_sql(sql_query: str) -> List[str]:
+    """Extract table names used in FROM and JOIN clauses from SQL query."""
+    # Normalize whitespace and line endings
+    sql_query = re.sub(r'\s+', ' ', sql_query)
+    
+    # Find tables from FROM clauses
+    from_tables = []
+    from_matches = re.finditer(r'FROM\s+([^\s,(;]+)', sql_query, re.IGNORECASE)
+    for match in from_matches:
+        table_name = match.group(1).strip().rstrip(';').rstrip(')')
+        # Clean up table name (remove quotes, etc.)
+        table_name = re.sub(r'[`"\[\]]', '', table_name)
+        from_tables.append(table_name)
+    
+    # Find tables from JOIN clauses
+    join_tables = []
+    join_matches = re.finditer(r'JOIN\s+([^\s,(;]+)', sql_query, re.IGNORECASE)
+    for match in join_matches:
+        table_name = match.group(1).strip().rstrip(';').rstrip(')')
+        # Clean up table name (remove quotes, etc.)
+        table_name = re.sub(r'[`"\[\]]', '', table_name)
+        join_tables.append(table_name)
+    
+    # Combine and deduplicate
+    all_tables = from_tables + join_tables
+    unique_tables = []
+    for table in all_tables:
+        # Ignore schema/database prefixes for variable naming
+        short_name = table.split('.')[-1]
+        if short_name not in [t.split('.')[-1] for t in unique_tables]:
+            unique_tables.append(table)
+    
+    return unique_tables
+
+def extract_table_name_from_sql(sql_query: str) -> str:
+    """Extract table or view name from SQL query."""
+    # Try to find CREATE TABLE/VIEW
+    create_match = re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+([^\s\(;]+)', 
+                           sql_query, re.IGNORECASE)
+    if create_match:
+        return create_match.group(1).strip('`[]"')
+    
+    # Try to find INSERT INTO / UPDATE
+    dml_match = re.search(r'(?:INSERT\s+INTO|UPDATE)\s+([^\s\(;]+)', 
+                        sql_query, re.IGNORECASE)
+    if dml_match:
+        return dml_match.group(1).strip('`[]"')
+    
+    # Try to find a procedure name
+    proc_match = re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+([^\s\(;]+)', 
+                         sql_query, re.IGNORECASE)
+    if proc_match:
+        return proc_match.group(1).strip('`[]"')
+    
+    # Default name for unrecognized patterns
+    return "query_job"
+
+def generate_table_variables(tables: List[str]) -> str:
+    """Generate table variable declarations for SQL."""
+    if not tables:
+        return ""
+    
+    variables = []
+    for table in tables:
+        # Create a variable name from the table name
+        short_name = table.split('.')[-1].lower()
+        var_name = f"v_{short_name}_table"
+        
+        # Handle fully qualified names differently
+        if '.' in table:
+            variables.append(f"set {var_name} = '{table}';")
+        else:
+            variables.append(f"set {var_name} = '{table}';")
+    
+    return "\n".join(variables) + "\n\n-- Table variables generated automatically\n"
+
+def replace_table_references(sql_query: str, tables: List[str]) -> str:
+    """Replace table references with identifier($var) syntax."""
+    modified_query = sql_query
+    
+    for table in sorted(tables, key=len, reverse=True):  # Process longer names first to avoid substring issues
+        short_name = table.split('.')[-1].lower()
+        var_name = f"$v_{short_name}_table"
+        
+        # Replace exact table name with identifier($var_name)
+        # Be careful with regex to match whole words/identifiers
+        pattern = r'(FROM|JOIN)\s+' + re.escape(table) + r'\b'
+        replacement = r'\1 identifier(' + var_name + r')'
+        modified_query = re.sub(pattern, replacement, modified_query, flags=re.IGNORECASE)
+    
+    return modified_query
+
+def extract_main_statement(sql_query: str) -> str:
+    """Extract the main SQL statement (CREATE/INSERT/etc) from a file with variables."""
+    # Split on semicolons and keep non-empty statements
+    statements = [s.strip() for s in sqlparse.split(sql_query) if s.strip()]
+    
+    if not statements:
+        return sql_query  # Return original if no statements found
+    
+    # Look for CREATE statements
+    for stmt in statements:
+        if re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|PROCEDURE)', stmt, re.IGNORECASE):
+            return stmt
+    
+    # Look for DML statements
+    for stmt in statements:
+        if re.search(r'(?:INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|MERGE\s+INTO)', stmt, re.IGNORECASE):
+            return stmt
+    
+    # Return the last statement if no CREATE or DML found (likely the main query)
+    return statements[-1]
+
+def extract_query_info(sql_query: str) -> Tuple[str, List[Dict[str, str]], str]:
+    """Extract query name, columns, and SQL type from SQL query."""
+    # Determine SQL type
+    sql_type = determine_sql_type(sql_query)
+    
+    # Extract the table/view/procedure name
+    query_name = extract_table_names_from_sql(sql_query)
+    
+    # Extract columns (only relevant for DDL)
+    columns = parse_columns_from_sql(sql_query) if sql_type == "ddl" else []
+    
+    return query_name, columns, sql_type
+
+def classify_sql_files(files_dict: Dict[str, str]) -> Dict[str, List[str]]:
+    """Classify SQL files into DDL, DML, and stored procedures."""
+    classification = {
+        "ddl": [],
+        "dml": [],
+        "storedproc": []
+    }
+    
+    for file_path, content in files_dict.items():
+        if file_path.endswith('.sql'):
+            _, _, sql_type = extract_query_info(content)
+            file_name = file_path.split('/')[-1]
+            classification[sql_type].append(file_name)
+    
+    return classification
+
+def preprocess_sql_query(sql_query: str, add_variable_header: bool = False, query_name: str = "") -> str:
+    """Preprocess SQL query to handle variables and multi-statement files."""
+    # Remove redundant whitespace and normalize line endings
+    sql_query = re.sub(r'\r\n', '\n', sql_query)
+    sql_query = re.sub(r'\n{3,}', '\n\n', sql_query)
+    
+    # Convert 'use variable' to 'use identifier($variable)'
+    sql_query = re.sub(r'USE\s+\$(\w+)', r'USE identifier(\$\1)', sql_query, flags=re.IGNORECASE)
+    
+    # Extract table names
+    tables = extract_table_names_from_sql(sql_query)
+    table_vars = generate_table_variables(tables)
+    
+    # Replace table references with identifier($var)
+    if tables:
+        sql_query = replace_table_references(sql_query, tables)
+    
+    # Add variable header if requested
+    if add_variable_header:
+        # Check if query already has variable declarations
+        has_variables = re.search(r'set\s+\w+\s*=', sql_query, re.IGNORECASE)
+        
+        header = generate_sql_variable_header(query_name)
+        
+        # Add table variables to header
+        if tables:
+            header += table_vars
+            
+        if not has_variables:
+            sql_query = header + "\n\n" + sql_query
+        else:
+            # Insert table variables after existing variables
+            var_end = 0
+            for match in re.finditer(r'set\s+\w+\s*=.*?;', sql_query, re.IGNORECASE | re.DOTALL):
+                var_end = max(var_end, match.end())
+            
+            if var_end > 0 and tables:
+                sql_query = sql_query[:var_end] + "\n\n" + table_vars + sql_query[var_end:]
+    
+    return sql_query
+
+def generate_deployment_config(
+    project_name: str,
+    modules: List[str],
+    env_config: Dict[str, Dict[str, Any]],
+    classified_files: Dict[str, Dict[str, List[str]]]
+) -> str:
+    """Generate deployment_config.yml content with comprehensive documentation."""
+    
+    # Create the initial structure with detailed documentation
+    header_comment = """####################################################################################################################
+# Snowrunner configuration file that defines what gets deployed to Snowflake across dev/uat/prd environments.
+# It is necessary to follow the below steps in order for snowrunner to deploy correctly. 
+#
+# 1. Define db_env_mapping section with the various DB environments, the snowrunner will be deploying the
+#    repository modules to (in below example, we have three environments that snowrunner can deploy code to).
+#    db_env_mapping:
+#      dev:
+#        - db_env: DEV (in the future this can be the branch DB name once we have cloning enabled)
+#      uat:
+#        - db_env: UAT
+#      prd:
+#        - db_env: PRD
+#
+# 2. Define a release_info section to let Snowrunner know what modules and code versions to package into a 
+#    given release (in example below, we are packaging module: {module_name} with code version v1 into a release r1).
+#    All the specified modules need to be stored within modules directory within the repository:
+#    release_info:
+#      number: r1
+#      r1:
+#        modules:
+#          - module: {module_name}
+#            code_versions:
+#              - v1
+#
+# 3. Then for each module defined in the release_info section, create the module section within 
+#    snowrunner_deployment_config outlining which versions of sql and streamlit code to include/exclude
+#    in the deployment. The deployment_inclusions and deployment_exclusions sections allows for certain 
+#    control of what the engineer wants to deploy or not for the specified module version.
+#    
+#    INCLUSION LOGIC [Necessary section of the deployment_config.yml file]
+#    When sub sql deployment types like ddl, dml, etc are listed under the sql deployment_inclusions section, 
+#    then Snowrunner will maintain order of operations and make sure that the deployment plan it generates
+#    follows the order specified in the yml configuration file.
+#    Additional information, the inclusion section which is an array type one can either specify '*' which 
+#    means deploy all files within the ddl/dml/storedproc directory or create multi line array element list 
+#    of the exact files that need to be deployed, example, if one wants my_table1.sql, my_table3.sql and
+#    my_table2.sql to be executed by the runner in that particular order, then one needs to define that
+#    under the sql ddl section in the following way: 
+#
+#    v1
+#      deployment_inclusions: 
+#        sql:
+#          ddl:
+#            - 'my_table1.sql'
+#            - 'my_table3.sql'
+#            - 'my_table2.sql'
+#
+#    EXCLUSION LOGIC [Optional section of the deployment_config.yml file]
+#    One can also define exclusion logic in couple of ways if they don't want the snowrunner to deploy something
+#    that might exist in the repository directory.
+#
+#    1. To exclude whole section from deployment, one can do that by simply not defining a particular directory 
+#       under the deployment_inclusions sql section.
+#    2. When the deployment_inclusions specifies '*' within ddl/dml/storedproc sections and one would like
+#       to omit certain file(s) within those git repository directories from getting deployed then one can
+#       specify exactly which files to exclude within the deployment_exclusions section letting snowrunner
+#       know to exclude them. Please see below:
+#       
+#       v1
+#         deployment_exclusions:
+#           sql:
+#             ddl:
+#               - 'drop_tables.sql'
+#               - 'my_table1.sql'
+#
+# Generated by SQL to Snowrunner CICD Template Converter on {date}
+####################################################################################################################
+""".format(module_name=modules[0] if modules else "sample", date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Rest of the function continues as before...
+    deployment_config = {
+        "version": "0.1", 
+        "snowrunner_deployment_config": {
+            "db_env_mapping": {},
+            "release_info": {
+                "number": "r1",
+                "r1": {
+                    "modules": []
+                }
+            }
+        }
+    }
+    
+    # Add environment mappings with more detailed configuration
+    for env_name, env_details in env_config.items():
+        db_env_mapping = []
+        
+        # Add db_env as the first entry
+        db_env_mapping.append({"db_env": env_details["db_env"]})
+        
+        # Add foundation database
+        if "fnd_db" in env_details:
+            db_env_mapping.append({"fnd_db": env_details["fnd_db"]})
+            
+        # Add target database
+        if "target_database" in env_details:
+            db_env_mapping.append({"target_database": env_details["target_database"]})
+            
+        # Add other common environment variables
+        for key in ["enr_database", "enr_schema", "bronze_schema", "schema"]:
+            if key in env_details and env_details[key]:
+                db_env_mapping.append({key: env_details[key]})
+        
+        # Add any remaining environment mappings
+        for key, value in env_details.items():
+            if key not in ["db_env", "fnd_db", "target_database", "enr_database", "enr_schema", "bronze_schema", "schema"] and value:
+                db_env_mapping.append({key: value})
+                
+        deployment_config["snowrunner_deployment_config"]["db_env_mapping"][env_name] = db_env_mapping
+    
+    # Add modules to release info with more metadata
+    for module in modules:
+        deployment_config["snowrunner_deployment_config"]["release_info"]["r1"]["modules"].append({
+            "module": module,
+            "code_versions": ["v1"]
+        })
+        
+        # Setup comprehensive module configuration
+        module_config = {
+            "v1": {
+                "deployment_inclusions": {
+                    "sql": {}
+                }
+            }
+        }
+        
+        # Add files for each SQL type if they exist with explicit environment overrides
+        for sql_type, files in classified_files[module].items():
+            if files:
+                if sql_type not in module_config["v1"]["deployment_inclusions"]["sql"]:
+                    module_config["v1"]["deployment_inclusions"]["sql"][sql_type] = {}
+                
+                # Add environment overrides
+                module_config["v1"]["deployment_inclusions"]["sql"][sql_type]["db_env_override"] = ["uat", "prd"]
+                
+                # Add script files with proper formatting
+                module_config["v1"]["deployment_inclusions"]["sql"][sql_type]["scripts"] = [f"'{file}'" for file in files]
+        
+        # Add an exclusions section as an example (commented out)
+        module_config["v1"]["deployment_exclusions"] = {
+            "sql": {}
+        }
+        
+        # Only add example exclusions if there are DDL files
+        if "ddl" in classified_files[module] and classified_files[module]["ddl"]:
+            module_config["v1"]["deployment_exclusions"]["sql"]["ddl"] = ["'# example_exclude.sql'"]
+        
+        # Add module config to main config
+        deployment_config["snowrunner_deployment_config"][module] = module_config
+        
+    # Convert to YAML with proper formatting
+    yaml_str = yaml.dump(deployment_config, sort_keys=False, default_flow_style=False)
+    
+    # Replace single quotes around file names for better formatting
+    yaml_str = re.sub(r"- '''(.*?)'''", r"- '\1'", yaml_str)
+    yaml_str = re.sub(r"- ''\[(.*?)\]''", r"- '\1'", yaml_str)
+    
+    return header_comment + yaml_str
+
+def generate_snowrunner_files(
+    sql_queries: List[str], 
+    project_config: Dict[str, Any],
+    cicd_platform: str,
+    module_structure: bool = False,
+    custom_ddl_files: List[str] = None,
+    custom_dml_files: List[str] = None
+) -> Dict[str, str]:
+    """Generate Snowrunner CICD template files from SQL queries."""
+    # Initialize custom file lists if None
+    custom_ddl_files = custom_ddl_files or []
+    custom_dml_files = custom_dml_files or []
+    project_name = project_config.get("project_name", "my_snowrunner_project")
+    env_name = project_config.get("env_name", "dev")
+    add_variable_header = project_config.get("add_variable_header", False)
+    
+    # Create project.yml
+    project_yaml = {
+        "name": project_name,
+        "config": {
+            "warehouse": project_config.get("warehouse", "compute_wh"),
+            "database": project_config.get("database", f"{env_name}_db"),
+            "schema": project_config.get("schema", "transforms"),
+            "role": project_config.get("role", "transform_role"),
+            "threads": project_config.get("threads", 4)
+        }
+    }
+    
+    # Add optional configurations if provided
+    if "timezone" in project_config and project_config["timezone"]:
+        project_yaml["config"]["timezone"] = project_config["timezone"]
+    if "target_path" in project_config and project_config["target_path"]:
+        project_yaml["config"]["target_path"] = project_config["target_path"]
+    if "packages" in project_config:
+        project_yaml["packages"] = project_config["packages"]
+    
+    files = {
+        f"{project_name}/project.yml": yaml.safe_dump(project_yaml, sort_keys=False)
+    }
+    
+    # Preprocess SQL queries
+    processed_queries = [sql_query for sql_query in sql_queries if sql_query.strip()]
+    
+    # Structure for module-based organization
+    if module_structure:
+        module_name = project_config.get("module_name", "default_module")
+        modules = [module_name]
+        module_files = {module_name: {"ddl": [], "dml": [], "storedproc": []}}
+        
+        # Process each SQL query for module structure
+        for idx, sql_query in enumerate(processed_queries, 1):
+            if not sql_query.strip():
+                continue
+                
+            query_name, columns, sql_type = extract_query_info(sql_query)
+
+            # Make sure query_name is a string
+            if isinstance(query_name, list):
+            # If it's still a list for some reason, use a default name with index
+            # query_name = f"query_job_{idx}"
+             query_name = f"usp_<add name for usp here>_{idx}"
+            
+            # Make sure query_name is unique
+            orig_query_name = query_name
+            name_counter = 1
+            file_path = f"{project_name}/modules/{module_name}/v1/sql/{sql_type}/{query_name}.sql"
+            while file_path in files:
+                query_name = f"{orig_query_name}_{name_counter}"
+                file_path = f"{project_name}/modules/{module_name}/v1/sql/{sql_type}/{query_name}.sql"
+                name_counter += 1
+            
+            # Add variable header if requested
+            if add_variable_header:
+                sql_query = preprocess_sql_query(sql_query, add_variable_header, query_name)
+            
+            # Store SQL file in the appropriate module directory
+            files[file_path] = sql_query
+            module_files[module_name][sql_type].append(f"{query_name}.sql")
+        
+        # Add custom DDL files if provided
+        if custom_ddl_files:
+            for file_name in custom_ddl_files:
+                if not file_name.endswith('.sql'):
+                    file_name += '.sql'
+                if file_name not in module_files[module_name]["ddl"]:
+                    module_files[module_name]["ddl"].append(file_name)
+                    
+                    # Create empty file if it doesn't already exist from SQL queries
+                    ddl_file_path = f"{project_name}/modules/{module_name}/v1/sql/ddl/{file_name}"
+                    if ddl_file_path not in files:
+                        if add_variable_header:
+                            # Generate basic file with variable header and basic create statement
+                            table_name = file_name.replace('.sql', '')
+                            file_content = preprocess_sql_query(
+                                f"-- TODO: Implement {table_name} creation\nCREATE OR REPLACE TABLE {table_name} (\n  -- Add columns here\n  id NUMBER\n);", 
+                                add_variable_header, 
+                                table_name
+                            )
+                            files[ddl_file_path] = file_content
+                        else:
+                            # Simply create empty file with placeholder comment
+                            files[ddl_file_path] = f"-- TODO: Implement {file_name} logic\n"
+                            
+        # Add custom DML files if provided
+        if custom_dml_files:
+            for file_name in custom_dml_files:
+                if not file_name.endswith('.sql'):
+                    file_name += '.sql'
+                if file_name not in module_files[module_name]["dml"]:
+                    module_files[module_name]["dml"].append(file_name)
+                    
+                    # Create empty file if it doesn't already exist from SQL queries
+                    dml_file_path = f"{project_name}/modules/{module_name}/v1/sql/dml/{file_name}"
+                    if dml_file_path not in files:
+                        if add_variable_header:
+                            # Generate basic file with variable header and simple DML statement
+                            table_name = file_name.replace('.sql', '')
+                            file_content = preprocess_sql_query(
+                                f"-- TODO: Implement {table_name} data manipulation\nSELECT * FROM some_table WHERE 1=1;\n", 
+                                add_variable_header, 
+                                table_name
+                            )
+                            files[dml_file_path] = file_content
+                        else:
+                            # Simply create empty file with placeholder comment
+                            files[dml_file_path] = f"-- TODO: Implement {file_name} logic\n"
+            
+        # Generate deployment_config.yml
+        env_config = {
+            "dev": {
+                "db_env": project_config.get("dev_env", "DEV"),
+                "target_database": project_config.get("dev_target_db", f"DEV_{project_config.get('database', 'DB')}"),
+                "fnd_db": project_config.get("dev_fnd_db", "DEV_FND_ENT_DB"),
+                "bronze_schema": project_config.get("dev_schema", "may_dev_db"),
+                "schema": project_config.get("schema", "transforms"),
+                "enr_database": project_config.get("dev_enr_db", "DEV_ENT_DB"),
+                "enr_schema": project_config.get("enr_schema", "ENTERPRISE_REPORTING")
+            },
+            "uat": {
+                "db_env": project_config.get("uat_env", "UAT"),
+                "target_database": project_config.get("uat_target_db", f"UAT_{project_config.get('database', 'DB')}"),
+                "fnd_db": project_config.get("uat_fnd_db", "UAT_FND_ENT_DB"),
+                "bronze_schema": project_config.get("uat_bronze_schema", "ABACUS_PRD_BRONZE"),
+                "schema": project_config.get("schema", "transforms"),
+                "enr_database": project_config.get("uat_enr_db", "UAT_ENT_DB"),
+                "enr_schema": project_config.get("enr_schema", "ENTERPRISE_REPORTING")
+            },
+            "prd": {
+                "db_env": project_config.get("prd_env", "PRD"),
+                "target_database": project_config.get("prd_target_db", f"PRD_{project_config.get('database', 'DB')}_DEDUP"),
+                "fnd_db": project_config.get("prd_fnd_db", "PRD_FND_ENT_DB"),
+                "bronze_schema": project_config.get("prd_bronze_schema", "PRD_BRONZE"),
+                "schema": project_config.get("schema", "transforms"),
+                "enr_database": project_config.get("prd_enr_db", "PRD_ENR_ENT_DB"),
+                "enr_schema": project_config.get("enr_schema", "ENTERPRISE_REPORTING")
+            }
+        }
+        
+        # Add deployment config file
+        files[f"{project_name}/deployment_config.yml"] = generate_deployment_config(
+            project_name, 
+            modules, 
+            env_config,
+            module_files
+        )
+        
+        # Add environment variables sample file for reference
+        env_vars_content = """# Environment variables for Snowrunner deployment
+# This file serves as a reference for the variables used in SQL scripts
+
+# Environment-specific variables
+DB_ENV=DEV  # Change to UAT or PRD for other environments
+
+# Database configurations
+target_database=DEV_TRST_ENT_DB  
+fnd_db=DEV_FND_ENT_DB
+
+# Schema settings
+trst_schema=STAGING
+dimensional_schema=dimensional
+bronze_schema=may_dev_db
+
+# Roles and permissions
+crud_role=DEV_E_CORE_CRUD_CORE_MSKD_ALLP_ACS
+ro_role=DEV_E_CORE_RO_CORE_MSKD_ALLP_ACS
+
+# Warehouse settings
+warehouse=DEV_caio_iet_developer_s_wh
+"""
+        files[f"{project_name}/.env.sample"] = env_vars_content
+        
+    else:
+        # Traditional structure (not module-based)
+        for idx, sql_query in enumerate(processed_queries, 1):
+            if not sql_query.strip():
+                continue
+                
+            query_name, columns, _ = extract_query_info(sql_query)
+            
+            # Make sure query_name is unique if we have multiple queries with the same name
+            orig_query_name = query_name
+            name_counter = 1
+            while f"{project_name}/models/{query_name}.sql" in files:
+                query_name = f"{orig_query_name}_{name_counter}"
+                name_counter += 1
+            
+            # Add variable header if requested
+            if add_variable_header:
+                sql_query = preprocess_sql_query(sql_query, add_variable_header, query_name)
+                
+            # Create query.yml
+            query_yaml = {
+                "version": 2,
+                "models": [
+                    {
+                        "name": query_name,
+                        "description": project_config.get("model_description", f"Generated from SQL query #{idx}"),
+                        "columns": columns
+                    }
+                ]
+            }
+            
+            # Add materialization config if provided
+            materialization = project_config.get("materialization")
+            if materialization:
+                query_yaml["models"][0]["config"] = {"materialized": materialization}
+            
+            # Add tags if provided
+            tags = project_config.get("tags")
+            if tags:
+                query_yaml["models"][0]["tags"] = tags.split(",")
+                
+            files[f"{project_name}/models/{query_name}.yml"] = yaml.safe_dump(query_yaml, sort_keys=False)
+            files[f"{project_name}/models/{query_name}.sql"] = sql_query
+    
+    # Generate CI/CD workflow file based on selected platform
+    if cicd_platform == "github":
+        cicd_yaml = generate_github_workflow(project_name, project_config, module_structure)
+        files[f"{project_name}/.github/workflows/cicd.yml"] = yaml.safe_dump(cicd_yaml, sort_keys=False)
+    
+    elif cicd_platform == "gitlab":
+        cicd_yaml = generate_gitlab_workflow(project_name, project_config, module_structure)
+        files[f"{project_name}/.gitlab-ci.yml"] = yaml.safe_dump(cicd_yaml, sort_keys=False)
+    
+    elif cicd_platform == "azure":
+        cicd_yaml = generate_azure_devops_workflow(project_name, project_config, module_structure)
+        files[f"{project_name}/azure-pipelines.yml"] = yaml.safe_dump(cicd_yaml, sort_keys=False)
+    
+    # Add README.md with appropriate instructions based on structure type
+    if module_structure:
+        readme_content = generate_module_readme(project_name, cicd_platform)
+    else:
+        readme_content = generate_standard_readme(project_name, cicd_platform)
+    
+    files[f"{project_name}/README.md"] = readme_content
+    
+    return files
+
+def generate_standard_readme(project_name: str, cicd_platform: str) -> str:
+    """Generate README for standard Snowrunner project."""
+    return f"""# {project_name}
+
+This is a Snowrunner project generated by the SQL to Snowrunner CICD Template Converter.
+
+## Project Structure
+- `project.yml` - Project configuration
+- `models/` - Contains SQL models and their YAML definitions
+- CI/CD configuration for {cicd_platform.title()}
+
+## Getting Started
+1. Install Snowrunner
+2. Configure your Snowflake connection
+3. Run `snowrunner compile` to validate your models
+4. Run `snowrunner run` to execute the models
+
+## Documentation
+For more information, visit [Snowflake Documentation](https://docs.snowflake.com/).
+"""
+
+def generate_module_readme(project_name: str, cicd_platform: str) -> str:
+    """Generate README for module-based Snowrunner project."""
+    return f"""# {project_name}
+
+This is a Snowrunner project with module-based structure generated by the SQL to Snowrunner CICD Template Converter.
+
+## Project Structure
+- `project.yml` - Project configuration
+- `modules/` - Contains modules with versioned SQL scripts
+  - `<module_name>/` - Module directory
+    - `v1/` - Version directory
+      - `sql/` - SQL scripts directory
+        - `ddl/` - DDL scripts (CREATE TABLE/VIEW, etc.)
+        - `dml/` - DML scripts (INSERT/UPDATE/DELETE/SELECT queries)
+        - `storedproc/` - Stored procedures
+- `deployment_config.yml` - Deployment configuration
+- `.env.sample` - Sample environment variables used in scripts
+- CI/CD configuration for {cicd_platform.title()}
+
+## Environment Variables
+SQL scripts may use environment variables like `$DB_ENV`, `$target_database`, etc.
+These are defined in the deployment_config.yml and automatically populated by Snowrunner.
+
+## Deployment Configuration
+The `deployment_config.yml` file controls:
+- Database environment mappings
+- Module release information
+- What files to include/exclude during deployment
+
+## Getting Started
+1. Install Snowrunner
+2. Configure your Snowflake connection
+3. Modify the `deployment_config.yml` as needed
+4. Run `snowrunner deploy --environment dev --config deployment_config.yml` to deploy to development
+
+## Documentation
+For more information about Snowrunner deployment, consult your organization's documentation.
+"""
+
+def generate_github_workflow(project_name: str, config: Dict[str, Any], module_structure: bool = False) -> Dict[str, Any]:
+    """Generate GitHub Actions workflow YAML."""
+    workflow = {
+        "name": f"{project_name} CI/CD",
+        "on": {
+            "push": {
+                "branches": [config.get("main_branch", "main")]
+            },
+            "pull_request": {
+                "branches": [config.get("main_branch", "main")]
+            },
+            "workflow_dispatch": {}  # Allow manual triggering
+        },
+        "jobs": {
+            "validate": {
+                "runs-on": "ubuntu-latest",
+                "steps": [
+                    {
+                        "name": "Checkout code",
+                        "uses": "actions/checkout@v3"
+                    },
+                    {
+                        "name": "Set up Python",
+                        "uses": "actions/setup-python@v4",
+                        "with": {
+                            "python-version": "3.9"
+                        }
+                    },
+                    {
+                        "name": "Setup Snowrunner",
+                        "run": "pip install snowrunner"
+                    },
+                    {
+                        "name": "Setup environment",
+                        "run": 'echo "SNOWFLAKE_ACCOUNT=${{ secrets.SNOWFLAKE_ACCOUNT }}\nSNOWFLAKE_USER=${{ secrets.SNOWFLAKE_USER }}\nSNOWFLAKE_PASSWORD=${{ secrets.SNOWFLAKE_PASSWORD }}" > .env'
+                    }
+                ]
+            }
+        }
+    }
+    
+    if module_structure:
+        # Add deploy jobs for module structure
+        workflow["jobs"]["validate"]["steps"].append({
+            "name": "Validate deployment config",
+            "run": f"snowrunner validate-config --config deployment_config.yml"
+        })
+        
+        # Add deployment jobs for each environment
+        for env in ["dev", "uat", "prd"]:
+            env_name = env.upper() if env == "prd" else env.upper()
+            
+            workflow["jobs"][f"deploy_{env}"] = {
+                "needs": "validate",
+                "if": f"github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/{config.get('main_branch', 'main')}'",
+                "runs-on": "ubuntu-latest",
+                "environment": env_name,
+                "steps": [
+                    {
+                        "name": "Checkout code",
+                        "uses": "actions/checkout@v3"
+                    },
+                    {
+                        "name": "Set up Python",
+                        "uses": "actions/setup-python@v4",
+                        "with": {
+                            "python-version": "3.9"
+                        }
+                    },
+                    {
+                        "name": "Setup Snowrunner",
+                        "run": "pip install snowrunner"
+                    },
+                    {
+                        "name": "Setup environment",
+                        "run": f'echo "SNOWFLAKE_ACCOUNT=${{{{ secrets.SNOWFLAKE_ACCOUNT }}}}\nSNOWFLAKE_USER=${{{{ secrets.SNOWFLAKE_USER }}}}\nSNOWFLAKE_PASSWORD=${{{{ secrets.SNOWFLAKE_PASSWORD }}}}\nDB_ENV={env.upper()}" > .env'
+                    },
+                    {
+                        "name": f"Deploy to {env_name}",
+                        "run": f"snowrunner deploy --environment {env} --config deployment_config.yml"
+                    }
+                ]
+            }
+    else:
+        # Add simple run job for standard structure
+        workflow["jobs"]["validate"]["steps"].append({
+            "name": "Validate models",
+                        "run": f"snowrunner compile --project {project_name}"
+        })
+        
+        workflow["jobs"]["deploy"] = {
+            "needs": "validate",
+            "if": f"github.ref == 'refs/heads/{config.get('main_branch', 'main')}'",
+            "runs-on": "ubuntu-latest",
+            "environment": config.get("env_name", "dev"),
+            "steps": [
+                {
+                    "name": "Checkout code",
+                    "uses": "actions/checkout@v3"
+                },
+                {
+                    "name": "Set up Python",
+                    "uses": "actions/setup-python@v4",
+                    "with": {
+                        "python-version": "3.9"
+                    }
+                },
+                {
+                    "name": "Setup Snowrunner",
+                    "run": "pip install snowrunner"
+                },
+                {
+                    "name": "Setup environment",
+                    "run": 'echo "SNOWFLAKE_ACCOUNT=${{ secrets.SNOWFLAKE_ACCOUNT }}\nSNOWFLAKE_USER=${{ secrets.SNOWFLAKE_USER }}\nSNOWFLAKE_PASSWORD=${{ secrets.SNOWFLAKE_PASSWORD }}" > .env'
+                },
+                {
+                    "name": "Run Snowrunner",
+                    "run": f"snowrunner run --project {project_name}"
+                }
+            ]
+        }
+    
+    return workflow
+
+def generate_gitlab_workflow(project_name: str, config: Dict[str, Any], module_structure: bool = False) -> Dict[str, Any]:
+    """Generate GitLab CI/CD workflow YAML."""
+    workflow = {
+        "stages": ["validate"],
+        "variables": {
+            "PROJECT_NAME": project_name
+        }
+    }
+    
+    validate_job = {
+        "stage": "validate",
+        "image": "python:3.9-slim",
+        "script": [
+            "pip install snowrunner",
+            "echo \"SNOWFLAKE_ACCOUNT=$SNOWFLAKE_ACCOUNT\nSNOWFLAKE_USER=$SNOWFLAKE_USER\nSNOWFLAKE_PASSWORD=$SNOWFLAKE_PASSWORD\" > .env",
+        ],
+        "rules": [
+            {"if": f"$CI_COMMIT_BRANCH == '{config.get('main_branch', 'main')}'"},
+            {"if": "$CI_PIPELINE_SOURCE == 'merge_request_event'"}
+        ]
+    }
+    
+    if module_structure:
+        # Module structure validation
+        validate_job["script"].append("snowrunner validate-config --config deployment_config.yml")
+        workflow["stages"].extend(["deploy_dev", "deploy_uat", "deploy_prd"])
+        
+        # Add deployment jobs for each environment
+        for env in ["dev", "uat", "prd"]:
+            env_name = env.upper() if env == "prd" else env.upper()
+            
+            workflow[f"deploy_{env}"] = {
+                "stage": f"deploy_{env}",
+                "image": "python:3.9-slim",
+                "script": [
+                    "pip install snowrunner",
+                    f"echo \"SNOWFLAKE_ACCOUNT=$SNOWFLAKE_ACCOUNT\nSNOWFLAKE_USER=$SNOWFLAKE_USER\nSNOWFLAKE_PASSWORD=$SNOWFLAKE_PASSWORD\nDB_ENV={env.upper()}\" > .env",
+                    f"snowrunner deploy --environment {env} --config deployment_config.yml"
+                ],
+                "rules": [
+                    {"if": f"$CI_COMMIT_BRANCH == '{config.get('main_branch', 'main')}'"}
+                ],
+                "environment": env_name
+            }
+            
+            # Add manual trigger for UAT and PRD
+            if env in ["uat", "prd"]:
+                workflow[f"deploy_{env}"]["when"] = "manual"
+    else:
+        # Standard structure validation
+        validate_job["script"].append(f"snowrunner compile --project {project_name}")
+        workflow["stages"].append("deploy")
+        
+        workflow["deploy_job"] = {
+            "stage": "deploy",
+            "image": "python:3.9-slim",
+            "script": [
+                "pip install snowrunner",
+                "echo \"SNOWFLAKE_ACCOUNT=$SNOWFLAKE_ACCOUNT\nSNOWFLAKE_USER=$SNOWFLAKE_USER\nSNOWFLAKE_PASSWORD=$SNOWFLAKE_PASSWORD\" > .env",
+                f"snowrunner run --project {project_name}"
+            ],
+            "rules": [
+                {"if": f"$CI_COMMIT_BRANCH == '{config.get('main_branch', 'main')}'"}
+            ],
+            "environment": config.get("env_name", "dev")
+        }
+    
+    workflow["validate_job"] = validate_job
+    return workflow
+
+def generate_azure_devops_workflow(project_name: str, config: Dict[str, Any], module_structure: bool = False) -> Dict[str, Any]:
+    """Generate Azure DevOps workflow YAML."""
+    workflow = {
+        "trigger": {
+            "branches": {
+                "include": [config.get("main_branch", "main")]
+            }
+        },
+        "pr": {
+            "branches": {
+                "include": [config.get("main_branch", "main")]
+            }
+        },
+        "pool": {
+            "vmImage": "ubuntu-latest"
+        },
+        "stages": [
+            {
+                "stage": "Validate",
+                "jobs": [
+                    {
+                        "job": "ValidateModels",
+                        "steps": [
+                            {
+                                "task": "UsePythonVersion@0",
+                                "inputs": {
+                                    "versionSpec": "3.9",
+                                    "addToPath": "true"
+                                }
+                            },
+                            {
+                                "script": "pip install snowrunner",
+                                "displayName": "Install Snowrunner"
+                            },
+                            {
+                                "script": "echo \"SNOWFLAKE_ACCOUNT=$(SNOWFLAKE_ACCOUNT)\nSNOWFLAKE_USER=$(SNOWFLAKE_USER)\nSNOWFLAKE_PASSWORD=$(SNOWFLAKE_PASSWORD)\" > .env",
+                                "displayName": "Setup environment"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    
+    if module_structure:
+        # Add validate step for module structure
+        workflow["stages"][0]["jobs"][0]["steps"].append({
+            "script": "snowrunner validate-config --config deployment_config.yml",
+            "displayName": "Validate deployment configuration"
+        })
+        
+        # Add deployment stages for each environment
+        for env in ["dev", "uat", "prd"]:
+            env_name = env.upper() if env == "prd" else env.upper()
+            
+            deploy_stage = {
+                "stage": f"Deploy_{env_name}",
+                "dependsOn": "Validate",
+                "jobs": [
+                    {
+                        "job": f"Deploy_{env_name}",
+                        "steps": [
+                            {
+                                "task": "UsePythonVersion@0",
+                                "inputs": {
+                                    "versionSpec": "3.9",
+                                    "addToPath": "true"
+                                }
+                            },
+                            {
+                                "script": "pip install snowrunner",
+                                "displayName": "Install Snowrunner"
+                            },
+                            {
+                                "script": f"echo \"SNOWFLAKE_ACCOUNT=$(SNOWFLAKE_ACCOUNT)\nSNOWFLAKE_USER=$(SNOWFLAKE_USER)\nSNOWFLAKE_PASSWORD=$(SNOWFLAKE_PASSWORD)\nDB_ENV={env.upper()}\" > .env",
+                                "displayName": "Setup environment"
+                            },
+                            {
+                                "script": f"snowrunner deploy --environment {env} --config deployment_config.yml",
+                                "displayName": f"Deploy to {env_name}"
+                            }
+                        ]
+                    }
+                ]
+            }
+            
+            # Add conditions for UAT and PRD
+            if env in ["uat", "prd"]:
+                deploy_stage["condition"] = "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))"
+            
+            workflow["stages"].append(deploy_stage)
+    else:
+        # Add validation step for standard structure
+        workflow["stages"][0]["jobs"][0]["steps"].append({
+            "script": f"snowrunner compile --project {project_name}",
+            "displayName": "Validate models"
+        })
+        
+        # Add deployment stage
+        workflow["stages"].append({
+            "stage": "Deploy",
+            "dependsOn": "Validate",
+            "condition": "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))",
+            "jobs": [
+                {
+                    "job": "DeployModels",
+                    "steps": [
+                        {
+                            "task": "UsePythonVersion@0",
+                            "inputs": {
+                                "versionSpec": "3.9",
+                                "addToPath": "true"
+                            }
+                        },
+                        {
+                            "script": "pip install snowrunner",
+                            "displayName": "Install Snowrunner"
+                        },
+                        {
+                            "script": "echo \"SNOWFLAKE_ACCOUNT=$(SNOWFLAKE_ACCOUNT)\nSNOWFLAKE_USER=$(SNOWFLAKE_USER)\nSNOWFLAKE_PASSWORD=$(SNOWFLAKE_PASSWORD)\" > .env",
+                            "displayName": "Setup environment"
+                        },
+                        {
+                            "script": f"snowrunner run --project {project_name}",
+                            "displayName": "Run models"
+                        }
+                    ]
+                }
+            ]
+        })
+    
+    return workflow
+
+def parse_existing_deployment_config(yaml_content: str) -> Dict[str, Any]:
+    """Parse an existing deployment_config.yml file to extract configuration."""
+    try:
+        config = yaml.safe_load(yaml_content)
+        if not config or "snowrunner_deployment_config" not in config:
+            raise ValueError("Invalid deployment config format")
+            
+        result = {"environments": {}, "modules": []}
+        
+        # Extract environments
+        if "db_env_mapping" in config["snowrunner_deployment_config"]:
+            for env_name, env_list in config["snowrunner_deployment_config"]["db_env_mapping"].items():
+                result["environments"][env_name] = {}
+                for env_item in env_list:
+                    for key, value in env_item.items():
+                        result["environments"][env_name][key] = value
+        
+        # Extract modules
+        if "release_info" in config["snowrunner_deployment_config"]:
+            release_num = config["snowrunner_deployment_config"]["release_info"]["number"]
+            if release_num in config["snowrunner_deployment_config"]["release_info"]:
+                if "modules" in config["snowrunner_deployment_config"]["release_info"][release_num]:
+                    for module_entry in config["snowrunner_deployment_config"]["release_info"][release_num]["modules"]:
+                        if "module" in module_entry:
+                            result["modules"].append(module_entry["module"])
+        
+        return result
+    except Exception as e:
+        st.error(f"Error parsing deployment config: {str(e)}")
+        return {"environments": {}, "modules": []}
+
+def main():
+    st.title("SQL to Snowrunner CICD Template Converter")
+    st.write("Convert your SQL queries to Snowrunner CICD templates with YAML files")
+    
+    # Create tabs for configuration and inputs
+    tabs = st.tabs(["Project Structure", "Configuration", "SQL Input", "Advanced", "Custom Files", "Environment Config", "Help"])
+    
+    with tabs[0]:
+        st.subheader("Project Structure")
+        project_structure = st.radio(
+            "Choose Project Structure", 
+            ["Standard Snowrunner Project", "Module-based Snowrunner Project"], 
+            index=0,
+            help="Standard: Models-based structure with simple deployment. Module-based: Versioned modules with deployment_config.yml"
+        )
+        module_structure = project_structure == "Module-based Snowrunner Project"
+        
+        if module_structure:
+            st.info("""
+            The module-based structure organizes SQL files into modules with versions:
+            - Modules contain versioned SQL organized by type (DDL, DML, Stored Procedures)
+            - Deployment controlled by deployment_config.yml
+            - Support for multi-environment deployment (DEV/UAT/PRD)
+            """)
+        else:
+            st.info("""
+            Standard structure is similar to dbt:
+            - SQL models with YAML definitions
+            - Simple deployment model
+            - Best for analytics and data transformations
+            """)
+    
+    with tabs[1]:
+        st.subheader("Project Configuration")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            project_name = st.text_input("Project Name", "my_snowrunner_project")
+            database = st.text_input("Default Database", "ent_db")
+            
+            if module_structure:
+                module_name = st.text_input("Module Name", "premium_rate")
+            else:
+                env_name = st.selectbox("Environment", ["dev", "uat", "prd"], index=0)
+        
+        with col2:
+            warehouse = st.text_input("Warehouse", "compute_wh")
+            schema = st.text_input("Schema", "transforms")
+            role = st.text_input("Role", "transform_role")
+            
+        cicd_platform = st.selectbox("CI/CD Platform", 
+                                    ["github", "gitlab", "azure"], 
+                                    format_func=lambda x: {"github": "GitHub Actions", 
+                                                          "gitlab": "GitLab CI/CD",
+                                                          "azure": "Azure DevOps"}[x])
+    
+    with tabs[2]:
+        st.subheader("SQL Input")
+        sql_mode = st.radio("Input Mode", ["Multiple Queries", "Single Query"])
+        
+        if sql_mode == "Single Query":
+            sql_queries = [st.text_area("Enter your SQL query", height=300,
+                                      placeholder="CREATE OR REPLACE TABLE my_table AS SELECT * FROM source_table")]
+        else:
+            sql_input = st.text_area("Enter multiple SQL queries separated by '--QUERY--'", height=300,
+                                   placeholder="CREATE OR REPLACE TABLE table1 AS SELECT * FROM source_table1\n\n--QUERY--\n\nCREATE OR REPLACE VIEW view1 AS SELECT * FROM source_table2")
+            sql_queries = [q.strip() for q in sql_input.split("--QUERY--") if q.strip()]
+            
+            st.info(f"Detected {len(sql_queries)} SQL queries")
+            
+        # Option to upload existing deployment config
+        if module_structure:
+            st.subheader("Upload Existing Configuration")
+            uploaded_config = st.file_uploader("Upload existing deployment_config.yml (optional)", type=["yml", "yaml"])
+            if uploaded_config:
+                try:
+                    config_content = uploaded_config.read().decode("utf-8")
+                    parsed_config = parse_existing_deployment_config(config_content)
+                    
+                    st.success(f"Successfully parsed configuration with {len(parsed_config['environments'])} environments and {len(parsed_config['modules'])} modules")
+                    st.json(parsed_config)
+                except Exception as e:
+                    st.error(f"Error reading configuration file: {str(e)}")
+    
+    with tabs[3]:
+        st.subheader("Advanced Configuration")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            threads = st.number_input("Threads", min_value=1, value=4)
+            timezone = st.text_input("Timezone (optional)", "")
+            target_path = st.text_input("Target Path (optional)", "")
+            main_branch = st.text_input("Main Branch Name", "main")
+            
+        with col2:
+            materialization = st.selectbox("Default Materialization", 
+                                          ["", "table", "view", "incremental", "ephemeral"], 
+                                          index=0)
+            tags = st.text_input("Model Tags (comma-separated)", "")
+            model_description = st.text_input("Model Description Template", "Generated from SQL query")
+            
+        # Add option for SQL variable header
+        add_variable_header = st.checkbox("Add Standard Variable Declarations to SQL Files", 
+                                        value=True, 
+                                        help="Adds standard Snowrunner variable declarations at the beginning of SQL files")
+            
+        packages = st.text_area("External Packages (YAML format)", 
+                               "# - package: dbt-labs/dbt_utils\n#   version: 0.8.0", 
+                               height=100)
+                               
+    # Add custom files tab
+    custom_ddl_files = []
+    custom_dml_files = []
+    
+    with tabs[4]:
+        st.subheader("Custom Files")
+        if module_structure:
+            st.info("Add custom file names that will be included in the deployment_config.yml and created as placeholder files.")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("DDL Files")
+                ddl_text = st.text_area(
+                    "Enter DDL file names (one per line)", 
+                    height=200,
+                    help="Files will be created under the DDL directory with standard variables",
+                    placeholder="table1.sql\ntable2.sql\nview1.sql"
+                )
+                if ddl_text:
+                    custom_ddl_files = [name.strip() for name in ddl_text.split("\n") if name.strip()]
+                    st.info(f"Added {len(custom_ddl_files)} custom DDL files")
+            
+            with col2:
+                st.subheader("DML Files")
+                dml_text = st.text_area(
+                    "Enter DML file names (one per line)", 
+                    height=200,
+                    help="Files will be created under the DML directory with standard variables",
+                    placeholder="query1.sql\nreport1.sql\ninsert_data.sql"
+                )
+                if dml_text:
+                    custom_dml_files = [name.strip() for name in dml_text.split("\n") if name.strip()]
+                    st.info(f"Added {len(custom_dml_files)} custom DML files")
+        else:
+            st.info("Custom file configuration is only available for module-based structure.")
+    
+    
+    # Initialize environment config variables with defaults
+    dev_env = "DEV"
+    dev_target_db = f"DEV_{database}"
+    dev_fnd_db = "DEV_FND_ENT_DB"
+    dev_schema = "may_dev_db"
+    dev_enr_db = "DEV_ENT_DB"
+    enr_schema = "ENTERPRISE_REPORTING"
+    
+    uat_env = "UAT"
+    uat_target_db = f"UAT_{database}"
+    uat_fnd_db = "UAT_FND_ENT_DB"
+    uat_bronze_schema = "ABACUS_PRD_BRONZE"
+    uat_enr_db = "UAT_ENT_DB"
+    
+    prd_env = "PRD"
+    prd_target_db = f"PRD_{database}_DEDUP"
+    prd_fnd_db = "PRD_FND_ENT_DB"
+    prd_bronze_schema = "ABACUS_PRD_BRONZE"
+    prd_enr_db = "PRD_ENR_ENT_DB"
+    
+    with tabs[5]:
+        if module_structure:
+            st.subheader("Environment Configuration")
+            
+            # Development Environment
+            with st.expander("Development Environment", expanded=True):
+                st.write("**Core Database Settings**")
+                dev_col1, dev_col2 = st.columns(2)
+                with dev_col1:
+                    dev_env = st.text_input("DEV Environment Name", "DEV")
+                    dev_target_db = st.text_input("DEV Target Database", f"DEV_{database}")
+                    dev_fnd_db = st.text_input("DEV Foundation Database", "DEV_FND_ENT_DB")
+                with dev_col2:
+                    dev_enr_db = st.text_input("DEV ENR Database", "DEV_ENT_DB")
+                    dev_schema = st.text_input("DEV Bronze Schema", "may_dev_db")
+                    enr_schema = st.text_input("Enterprise Reporting Schema", "ENTERPRISE_REPORTING")
+            
+            # UAT Environment
+            with st.expander("UAT Environment", expanded=False):
+                st.write("**Core Database Settings**")
+                uat_col1, uat_col2 = st.columns(2)
+                with uat_col1:
+                    uat_env = st.text_input("UAT Environment Name", "UAT")
+                    uat_target_db = st.text_input("UAT Target Database", f"UAT_{database}")
+                    uat_fnd_db = st.text_input("UAT Foundation Database", "UAT_FND_ENT_DB")
+                with uat_col2:
+                    uat_enr_db = st.text_input("UAT ENR Database", "UAT_ENT_DB")
+                    uat_bronze_schema = st.text_input("UAT Bronze Schema", "ABACUS_PRD_BRONZE")
+            
+            # Production Environment
+            with st.expander("Production Environment", expanded=False):
+                st.write("**Core Database Settings**")
+                prd_col1, prd_col2 = st.columns(2)
+                with prd_col1:
+                    prd_env = st.text_input("PRD Environment Name", "PRD")
+                    prd_target_db = st.text_input("PRD Target Database", f"PRD_{database}_DEDUP")
+                    prd_fnd_db = st.text_input("PRD Foundation Database", "PRD_FND_ENT_DB")
+                with prd_col2:
+                    prd_enr_db = st.text_input("PRD ENR Database", "PRD_ENR_ENT_DB")
+                    prd_bronze_schema = st.text_input("PRD Bronze Schema", "ABACUS_PRD_BRONZE")
+
+                
+    with tabs[6]:
+        st.subheader("Help & Information")
+        st.markdown("""
+        ### About This Tool
+        
+        This tool converts SQL queries into a structured Snowrunner project with CICD templates.
+        
+        ### Standard vs. Module-Based Structures
+        
+        **Standard Structure**
+        - Similar to dbt project structure
+        - Models directory with SQL files and YAML definitions
+        - Simple deployment model
+        
+        **Module-Based Structure**
+        - Organizes code into modules with version control
+        - Uses deployment_config.yml for environment management
+        - Supports DEV/UAT/PRD workflow
+        - SQL files organized by type (DDL, DML, Stored Procedures)
+        
+        ### SQL Requirements
+        - Your SQL should be valid Snowflake SQL
+        - For best column detection, use column aliases with AS
+        - Variable declarations are supported and preserved
+        
+        ### Supported CI/CD Platforms
+        - GitHub Actions
+        - GitLab CI/CD
+        - Azure DevOps
+        """)
+    
+    # Generate button
+    if st.button("Generate Snowrunner Template", type="primary"):
+        if not any(sql.strip() for sql in sql_queries) and not custom_ddl_files and not custom_dml_files:
+            st.error("Please enter at least one SQL query or custom file")
+        else:
+            try:
+                # Collect all configuration
+                project_config = {
+                    "project_name": project_name,
+                    "database": database,
+                    "warehouse": warehouse,
+                    "schema": schema,
+                    "role": role,
+                    "threads": threads,
+                    "main_branch": main_branch,
+                    "add_variable_header": add_variable_header
+                }
+                
+                # Add structure-specific configurations
+                # Add this to the project_config population in the main function
+                if module_structure:
+                    project_config["module_name"] = module_name
+                    
+                    # Add environment configuration
+                    project_config["dev_env"] = dev_env
+                    project_config["dev_target_db"] = dev_target_db
+                    project_config["dev_fnd_db"] = dev_fnd_db
+                    project_config["dev_schema"] = dev_schema
+                    project_config["dev_enr_db"] = dev_enr_db
+                    project_config["enr_schema"] = enr_schema
+                    
+                    project_config["uat_env"] = uat_env
+                    project_config["uat_target_db"] = uat_target_db
+                    project_config["uat_fnd_db"] = uat_fnd_db
+                    project_config["uat_bronze_schema"] = uat_bronze_schema
+                    project_config["uat_enr_db"] = uat_enr_db
+                    
+                    project_config["prd_env"] = prd_env
+                    project_config["prd_target_db"] = prd_target_db
+                    project_config["prd_fnd_db"] = prd_fnd_db
+                    project_config["prd_bronze_schema"] = prd_bronze_schema
+                    project_config["prd_enr_db"] = prd_enr_db
+                else:
+                    project_config["env_name"] = env_name
+                
+                # Add optional configurations
+                if timezone:
+                    project_config["timezone"] = timezone
+                if target_path:
+                    project_config["target_path"] = target_path
+                if materialization:
+                    project_config["materialization"] = materialization
+                if tags:
+                    project_config["tags"] = tags
+                if model_description:
+                    project_config["model_description"] = model_description
+                
+                # Process packages if not empty
+                if packages and not packages.startswith("#"):
+                    try:
+                        packages_yaml = yaml.safe_load(packages)
+                        if packages_yaml:
+                            project_config["packages"] = packages_yaml
+                    except Exception as e:
+                        st.warning(f"Could not parse packages YAML: {str(e)}")
+                
+                # Convert SQL to Snowrunner template
+                files = generate_snowrunner_files(
+                    sql_queries, 
+                    project_config, 
+                    cicd_platform, 
+                    module_structure,
+                    custom_ddl_files=custom_ddl_files,
+                    custom_dml_files=custom_dml_files
+                )
+                
+                # Create a zip file in memory
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED, False) as zip_file:
+                    for file_path, file_content in files.items():
+                        # Create directories in the ZIP
+                        path_parts = file_path.split('/')
+                        if len(path_parts) > 1:
+                            dir_path = ""
+                            for part in path_parts[:-1]:
+                                dir_path = f"{dir_path}{part}/"
+                                try:
+                                    zip_file.getinfo(f"{dir_path}")
+                                except KeyError:
+                                    zip_file.writestr(f"{dir_path}", "")
+                        
+                        # Write the file
+                        zip_file.writestr(file_path, file_content)
+                
+                zip_buffer.seek(0)
+                
+                # Show preview of generated files
+                if module_structure:
+                    st.success(f"Module-based Snowrunner template generated successfully with {len(files)} files!")
+                else:
+                    st.success(f"Standard Snowrunner template generated successfully with {len(files)} files!")
+                
+                # Group files by directory for cleaner display
+                file_groups = {}
+                for file_path in files.keys():
+                    parts = file_path.split('/')
+                    if len(parts) <= 2:  # Root files or direct children of project
+                        group = "Project Root"
+                    else:
+                        group = '/'.join(parts[0:-1])
+                    
+                    if group not in file_groups:
+                        file_groups[group] = []
+                    file_groups[group].append(file_path)
+                
+                # Display files by group
+                for group, file_paths in sorted(file_groups.items()):
+                    with st.expander(f"{group} ({len(file_paths)} files)"):
+                        for file_path in sorted(file_paths):
+                            lang = ""
+                            if file_path.endswith(".yml"):
+                                lang = "yaml"
+                            elif file_path.endswith(".sql"):
+                                lang = "sql"
+                            elif file_path.endswith(".md"):
+                                lang = "markdown"
+                                
+                            st.subheader(file_path.split('/')[-1])
+                            st.code(files[file_path], language=lang)
+                
+                # Download button for the zip file
+                if module_structure:
+                    zip_filename = f"{project_name}_module_template.zip"
+                else:
+                    zip_filename = f"{project_name}_standard_template.zip"
+                    
+                st.download_button(
+                    label="Download Snowrunner Template",
+                    data=zip_buffer,
+                    file_name=zip_filename,
+                    mime="application/zip",
+                    key="download_button"
+                )
+                
+                # Next steps instructions
+                st.subheader("Next Steps:")
+                if module_structure:
+                    st.markdown(f"""
+                    1. Download and extract the {zip_filename} file
+                    2. Review the `deployment_config.yml` file and adjust as needed
+                    3. Set up your CI/CD environment with the required secrets
+                    4. For local testing run: `snowrunner deploy --environment dev --config deployment_config.yml`
+                    5. Commit the files to your repository to trigger the CI/CD pipeline
+                    """)
+                else:
+                    st.markdown(f"""
+                    1. Download and extract the {zip_filename} file
+                    2. Review the models and customize as needed
+                    3. Set up your CI/CD environment with the required secrets
+                    4. For local testing run: `snowrunner compile --project {project_name}`
+                    5. Commit the files to your repository to trigger the CI/CD pipeline
+                    """)
+                
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+                st.exception(e)
+
+if __name__ == "__main__":
+    main()
